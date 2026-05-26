@@ -5,16 +5,14 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 3800;
+const PORT = process.env.PORT || 8080;  // تم التغيير من 3800 إلى 8080
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// =============== قوائم الهجوم ===============
+// =============== قوائم متعددة للتمويه ===============
 
-// قائمة وكيلات (User Agents) حقيقية
 const userAgents = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
@@ -26,60 +24,52 @@ const userAgents = [
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1'
 ];
 
-// قائمة بقيم Accept-Language
 const acceptLanguages = [
     'en-US,en;q=0.9,ar;q=0.8',
     'ar-SA,ar;q=0.9,en;q=0.8',
     'en-US,en;q=0.9',
     'ar,en;q=0.9',
-    'fr-FR,fr;q=0.9,en;q=0.8',
-    'de-DE,de;q=0.9,en;q=0.8'
+    'fr-FR,fr;q=0.9,en;q=0.8'
 ];
 
-// قائمة بــ Accept-Encoding
-const acceptEncodings = [
-    'gzip, deflate, br',
-    'gzip, deflate',
-    'br, gzip, deflate'
-];
-
-// قائمة بــ Sec-Ch-Ua
-const secChUa = [
-    '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-    '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"'
-];
-
-// قائمة بروابط مرجعية (Referrers) مختلفة
 const referrers = [
     'https://www.google.com/',
     'https://www.facebook.com/',
     'https://twitter.com/',
     'https://www.youtube.com/',
     'https://www.reddit.com/',
-    'https://www.mediafire.com/',
-    'https://www.bing.com/',
-    'https://duckduckgo.com/'
+    'https://www.mediafire.com/'
 ];
 
-// قائمة بـ IPs سبوفينج (اختياري - يشتغل مع بعض السيرفرات)
-const xForwardedFor = [
-    '192.168.1.1',
-    '10.0.0.1',
-    '172.16.0.1',
-    '8.8.8.8',
-    '1.1.1.1'
+const secChUa = [
+    '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+    '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"'
 ];
 
 /**
- * الحصول على رؤوس عشوائية لكل طلب
+ * إنشاء بصمة رقمية جديدة تماماً لكل طلب
  */
-function getRandomHeaders() {
+function generateFingerprint() {
+    return {
+        sessionId: crypto.randomBytes(32).toString('hex'),
+        deviceId: crypto.randomBytes(16).toString('hex'),
+        timestamp: Date.now(),
+        random: Math.random().toString(36).substring(2, 15)
+    };
+}
+
+/**
+ * رؤوس HTTP جديدة بالكامل لكل طلب
+ */
+function getFreshHeaders() {
+    const fp = generateFingerprint();
+    
     return {
         'User-Agent': userAgents[Math.floor(Math.random() * userAgents.length)],
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': acceptLanguages[Math.floor(Math.random() * acceptLanguages.length)],
-        'Accept-Encoding': acceptEncodings[Math.floor(Math.random() * acceptEncodings.length)],
+        'Accept-Encoding': 'gzip, deflate, br',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1',
         'Sec-Fetch-Dest': 'document',
@@ -89,103 +79,88 @@ function getRandomHeaders() {
         'Sec-Ch-Ua': secChUa[Math.floor(Math.random() * secChUa.length)],
         'Sec-Ch-Ua-Mobile': '?0',
         'Sec-Ch-Ua-Platform': Math.random() > 0.5 ? '"Windows"' : '"macOS"',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
+        'Expires': '0',
         'DNT': '1',
         'Referer': referrers[Math.floor(Math.random() * referrers.length)],
-        'X-Forwarded-For': xForwardedFor[Math.floor(Math.random() * xForwardedFor.length)],
-        'X-Real-IP': `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`
+        'Cookie': `__cf_bm=${fp.sessionId}; _ga=GA1.2.${Math.floor(Math.random() * 9999999)}.${fp.timestamp}; _gid=GA1.2.${Math.floor(Math.random() * 9999999)}.${fp.timestamp}; device_id=${fp.deviceId}; session=${fp.random}`,
+        'X-Requested-With': 'XMLHttpRequest'
     };
 }
 
 /**
- * تأخير عشوائي بين الهجمات
+ * تأخير عشوائي قصير
  */
-function randomDelay(min = 500, max = 3000) {
+function randomDelay(min = 300, max = 1200) {
     return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
 }
 
 /**
- * هجوم متعدد المحاولات لاستخراج الرابط
+ * استخراج الرابط مع تجديد كامل للهوية
  */
-async function extractWithAttack(mediafireUrl, maxAttempts = 5) {
-    console.log(`\n🎯 بدء سلسلة هجمات على: ${mediafireUrl}`);
-    console.log(`📊 عدد المحاولات: ${maxAttempts}`);
+async function extractDirectLink(mediafireUrl) {
+    console.log(`\n🔍 بدء استخراج الرابط: ${mediafireUrl}`);
     
     let lastError = null;
     
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        console.log(`\n⚔️ الهجوم رقم ${attempt}/${maxAttempts}`);
+    // 3 محاولات بهويات مختلفة
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        console.log(`\n📡 محاولة ${attempt}/3 - تجديد الهوية بالكامل...`);
         
-        // تغيير الرؤوس في كل محاولة
-        const headers = getRandomHeaders();
-        console.log(`📱 User-Agent ${attempt}: ${headers['User-Agent'].substring(0, 40)}...`);
-        console.log(`🌐 Referer ${attempt}: ${headers['Referer']}`);
+        const headers = getFreshHeaders();
+        console.log(`   👤 User-Agent: ${headers['User-Agent'].substring(0, 50)}...`);
+        console.log(`   🍪 Session: ${headers['Cookie'].substring(0, 40)}...`);
         
-        // تأخير عشوائي بين الهجمات (تجنب الاكتشاف)
         if (attempt > 1) {
-            const delay = randomDelay(1000, 4000);
-            console.log(`⏳ انتظار ${Math.round(delay/1000)} ثواني قبل الهجوم التالي...`);
+            const delay = randomDelay(1000, 2500);
+            console.log(`   ⏳ انتظار ${Math.round(delay/1000)} ثانية...`);
             await delay;
         }
         
         try {
-            // الهجوم: طلب الصفحة
             const { data: html } = await axios.get(mediafireUrl, {
                 headers: headers,
                 timeout: 15000,
                 maxRedirects: 5,
                 withCredentials: true,
-                // محاكاة أخطاء بسيطة أحياناً (سلوك بشري)
-                validateStatus: status => status < 500
+                params: { _t: Date.now(), _r: Math.random() }
             });
             
-            // التحقق من reCAPTCHA
             if (html.includes('recaptcha') || html.includes('verify') || html.includes('I\'m not a robot')) {
-                console.log(`🤖 تم اكتشاف CAPTCHA في الهجوم ${attempt}`);
+                console.log(`   🤖 تم اكتشاف CAPTCHA في المحاولة ${attempt}`);
                 
-                // محاولة استخراج الرابط رغم CAPTCHA
-                const directLink = extractLinkFromHtml(html);
-                if (directLink) {
-                    console.log(`✅ نجح الهجوم ${attempt} رغم CAPTCHA!`);
-                    return { success: true, directLink: directLink, attempt: attempt };
+                const link = extractLinkFromHtml(html);
+                if (link) {
+                    console.log(`   ✅ تم استخراج رابط رغم CAPTCHA!`);
+                    return { success: true, directLink: link, attempt: attempt };
                 }
                 continue;
             }
             
-            // محاولة استخراج الرابط
             const directLink = extractLinkFromHtml(html);
             if (directLink) {
-                console.log(`✅ نجح الهجوم ${attempt}!`);
+                console.log(`   ✅ نجحت المحاولة ${attempt}!`);
                 return { success: true, directLink: directLink, attempt: attempt };
             }
             
-            // إذا لم نجد رابط، جرب طريقة مختلفة
-            console.log(`⚠️ الهجوم ${attempt} فشل في العثور على رابط`);
-            
-            // محاولة البحث في النصوص البرمجية
             const scriptLink = extractFromScripts(html);
             if (scriptLink) {
-                console.log(`✅ تم العثور على رابط في النصوص البرمجية (هجوم ${attempt})`);
+                console.log(`   ✅ تم استخراج من script في المحاولة ${attempt}`);
                 return { success: true, directLink: scriptLink, attempt: attempt };
             }
             
-            lastError = 'لم يتم العثور على رابط مباشر';
+            console.log(`   ⚠️ لم يتم العثور على رابط في المحاولة ${attempt}`);
+            lastError = 'لم يتم العثور على رابط';
             
         } catch (error) {
-            console.log(`💥 الهجوم ${attempt} فشل: ${error.message}`);
+            console.log(`   ❌ خطأ في المحاولة ${attempt}: ${error.message}`);
             lastError = error.message;
-            
-            // إذا كان خطأ 403 أو 429 (ممنوع أو طلبات كثيرة)
-            if (error.response && (error.response.status === 403 || error.response.status === 429)) {
-                console.log(`🚫 تم حظر الهجوم ${attempt}، انتظار أطول...`);
-                await randomDelay(3000, 6000);
-            }
         }
     }
     
-    console.log(`\n❌ فشلت جميع الهجمات ${maxAttempts}`);
-    return { success: false, error: lastError || 'فشلت جميع محاولات الاختراق' };
+    console.log(`\n❌ فشلت جميع المحاولات`);
+    return { success: false, error: lastError || 'فشل الاستخراج' };
 }
 
 /**
@@ -194,7 +169,6 @@ async function extractWithAttack(mediafireUrl, maxAttempts = 5) {
 function extractLinkFromHtml(html) {
     const $ = cheerio.load(html);
     
-    // قائمة بطرق الاستخراج
     const selectors = [
         '#downloadButton',
         'a.downloadButton',
@@ -203,33 +177,27 @@ function extractLinkFromHtml(html) {
         'div.download_link a',
         'a.btn-primary',
         'a[href*="download"]',
-        'a[href*="mediafire.com/file/"]',
-        '[data-download-url]',
-        '[data-link]'
+        'a[href*="mediafire.com/file/"]'
     ];
     
     for (const selector of selectors) {
-        const element = $(selector);
-        for (let i = 0; i < element.length; i++) {
-            const href = $(element[i]).attr('href');
-            if (href && href.includes('mediafire.com') && !href.includes('recaptcha')) {
-                return normalizeLink(href);
-            }
+        const href = $(selector).attr('href');
+        if (href && href.includes('mediafire.com') && !href.includes('recaptcha')) {
+            return normalizeLink(href);
         }
     }
     
-    // البحث عن أي رابط يحتوي على download
-    let foundLink = null;
+    let found = null;
     $('a').each((i, el) => {
         const href = $(el).attr('href');
         if (href && (href.includes('download.mediafire.com') || 
             (href.includes('mediafire.com') && href.includes('/file/')))) {
-            foundLink = href;
+            found = href;
             return false;
         }
     });
     
-    return foundLink ? normalizeLink(foundLink) : null;
+    return found ? normalizeLink(found) : null;
 }
 
 /**
@@ -239,10 +207,7 @@ function extractFromScripts(html) {
     const patterns = [
         /"download_link"\s*:\s*"([^"]+)"/i,
         /downloadUrl\s*:\s*['"]([^'"]+)['"]/i,
-        /"href"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"Download/i,
-        /https:\/\/download\d+\.mediafire\.com\/[a-z0-9]+\/[a-z0-9]+\/[^'"\s]+/i,
-        /window\.location\s*=\s*['"]([^'"]+)['"]/i,
-        /setAttribute\('href',\s*['"]([^'"]+)['"]\)/i
+        /https:\/\/download\d+\.mediafire\.com\/[a-z0-9]+\/[a-z0-9]+\/[^'"\s]+/i
     ];
     
     for (const pattern of patterns) {
@@ -254,7 +219,6 @@ function extractFromScripts(html) {
             }
         }
     }
-    
     return null;
 }
 
@@ -262,21 +226,16 @@ function extractFromScripts(html) {
  * تطبيع الرابط
  */
 function normalizeLink(link) {
-    if (link.startsWith('//')) {
-        link = 'https:' + link;
-    } else if (link.startsWith('/')) {
-        link = 'https://www.mediafire.com' + link;
-    }
-    link = link.split('?')[0];
-    link = link.replace(/&amp;/g, '&');
-    return link;
+    if (link.startsWith('//')) link = 'https:' + link;
+    if (link.startsWith('/')) link = 'https://www.mediafire.com' + link;
+    return link.split('?')[0].replace(/&amp;/g, '&');
 }
 
-// =============== API Endpoints ===============
+// =============== API ===============
 
 app.post('/api/extract', async (req, res) => {
     try {
-        const { url, maxAttempts = 5 } = req.body;
+        const { url } = req.body;
         
         if (!url) {
             return res.status(400).json({ success: false, error: 'يرجى إرسال رابط MediaFire' });
@@ -286,22 +245,17 @@ app.post('/api/extract', async (req, res) => {
             return res.status(400).json({ success: false, error: 'الرابط يجب أن يكون من موقع MediaFire' });
         }
         
-        console.log(`\n🎯 طلب جديد: ${url}`);
-        console.log(`💪 عدد الهجمات: ${maxAttempts}`);
-        
-        const result = await extractWithAttack(url, parseInt(maxAttempts));
-        
+        const result = await extractDirectLink(url);
         res.json(result);
         
     } catch (error) {
-        console.error('❌ خطأ:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
 app.get('/api/extract', async (req, res) => {
     try {
-        const { url, attempts = 5 } = req.query;
+        const { url } = req.query;
         
         if (!url) {
             return res.status(400).json({ success: false, error: 'يرجى إضافة رابط MediaFire' });
@@ -311,7 +265,7 @@ app.get('/api/extract', async (req, res) => {
             return res.status(400).json({ success: false, error: 'الرابط يجب أن يكون من موقع MediaFire' });
         }
         
-        const result = await extractWithAttack(url, parseInt(attempts));
+        const result = await extractDirectLink(url);
         res.json(result);
         
     } catch (error) {
@@ -323,267 +277,70 @@ app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'healthy', 
         timestamp: new Date().toISOString(),
-        attackModes: 'متعددة',
-        userAgents: userAgents.length
+        message: 'كل طلب بهوية جديدة تماماً'
     });
 });
 
-// =============== الصفحة الرئيسية ===============
+// =============== صفحة رئيسية بسيطة ===============
 
 app.get('/', (req, res) => {
-    const html = `<!DOCTYPE html>
+    res.send(`
+    <!DOCTYPE html>
     <html>
     <head>
-        <title>🎬 MediaFire Attack Mode - استخراج الفيديوهات</title>
+        <title>MediaFire Extractor - وضع الاختراق</title>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
-                min-height: 100vh;
-                padding: 20px;
-            }
-            .container { max-width: 1300px; margin: 0 auto; }
-            .header { text-align: center; margin-bottom: 30px; }
-            .header h1 { color: white; font-size: 2rem; margin-bottom: 10px; }
-            .header h1 span { background: #e74c3c; padding: 5px 15px; border-radius: 30px; font-size: 0.9rem; }
-            .header p { color: rgba(255,255,255,0.7); }
-            .main-content { display: grid; grid-template-columns: 1fr 1fr; gap: 25px; }
-            @media (max-width: 900px) { .main-content { grid-template-columns: 1fr; } }
-            .card {
-                background: rgba(255,255,255,0.95);
-                border-radius: 20px;
-                padding: 25px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            }
-            .card h2 {
-                color: #333;
-                margin-bottom: 20px;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                border-bottom: 2px solid #e74c3c;
-                padding-bottom: 10px;
-            }
-            .input-group { margin-bottom: 20px; }
-            label { display: block; margin-bottom: 8px; font-weight: bold; color: #555; }
-            input[type="text"], select {
-                width: 100%;
-                padding: 12px 15px;
-                border: 2px solid #e0e0e0;
-                border-radius: 12px;
-                font-size: 14px;
-                transition: all 0.3s ease;
-            }
-            input[type="text"]:focus, select:focus {
-                outline: none;
-                border-color: #e74c3c;
-                box-shadow: 0 0 0 3px rgba(231,76,60,0.1);
-            }
-            button {
-                background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-                color: white;
-                border: none;
-                padding: 12px 25px;
-                border-radius: 12px;
-                font-size: 16px;
-                font-weight: bold;
-                cursor: pointer;
-                transition: all 0.3s ease;
-                width: 100%;
-            }
-            button:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(231,76,60,0.4); }
-            button:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-            .loading { text-align: center; padding: 20px; display: none; }
-            .spinner {
-                width: 40px;
-                height: 40px;
-                border: 3px solid #f3f3f3;
-                border-top: 3px solid #e74c3c;
-                border-radius: 50%;
-                animation: spin 0.8s linear infinite;
-                margin: 0 auto 10px;
-            }
-            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-            .video-container { background: #000; border-radius: 12px; overflow: hidden; }
-            video { width: 100%; max-height: 400px; display: block; }
-            .video-info { padding: 15px; background: #f8f9fa; }
-            .video-title { font-size: 1.1rem; font-weight: bold; color: #333; word-break: break-all; margin-bottom: 10px; }
-            .video-controls { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
-            .btn-small { background: #3498db; padding: 8px 15px; font-size: 13px; width: auto; }
-            .btn-small:hover { background: #2980b9; }
-            .btn-download { background: #27ae60; }
-            .btn-download:hover { background: #219a52; }
-            .extracted-link { margin-top: 15px; padding: 10px; background: #e8f4f8; border-radius: 8px; font-size: 12px; word-break: break-all; font-family: monospace; }
-            .error { background: #fee; border: 1px solid #fcc; color: #c33; padding: 12px; border-radius: 10px; margin-top: 15px; display: none; }
-            .success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; padding: 12px; border-radius: 10px; margin-top: 15px; display: none; }
-            .attack-log {
-                background: #1a1a2e;
-                color: #0f0;
-                font-family: monospace;
-                font-size: 12px;
-                padding: 15px;
-                border-radius: 10px;
-                margin-top: 15px;
-                max-height: 200px;
-                overflow-y: auto;
-                display: none;
-            }
-            .examples { margin-top: 20px; padding-top: 15px; border-top: 1px solid #eee; }
-            .example-link {
-                background: #f0f0f0;
-                padding: 8px 12px;
-                margin: 5px;
-                border-radius: 8px;
-                font-size: 12px;
-                cursor: pointer;
-                display: inline-block;
-            }
-            .example-link:hover { background: #e0e0e0; }
+            body { font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }
+            input, button { padding: 10px; margin: 10px 0; width: 100%; }
+            button { background: #007bff; color: white; border: none; cursor: pointer; }
+            .result { margin-top: 20px; padding: 15px; background: #f0f0f0; border-radius: 8px; word-break: break-all; }
+            video { width: 100%; margin-top: 20px; }
         </style>
     </head>
     <body>
-        <div class="container">
-            <div class="header">
-                <h1>🎬 MediaFire Attack Mode <span>⚔️ هجوم</span></h1>
-                <p>سلسلة هجمات متعددة - تغيير الهوية - محاولات اختراق ذكية</p>
-            </div>
-            <div class="main-content">
-                <div class="card">
-                    <h2><span>⚔️</span> إعدادات الهجوم</h2>
-                    <div class="input-group">
-                        <label>🎯 رابط MediaFire:</label>
-                        <input type="text" id="mediaUrl" placeholder="https://www.mediafire.com/file/...">
-                    </div>
-                    <div class="input-group">
-                        <label>💪 عدد الهجمات:</label>
-                        <select id="attackCount">
-                            <option value="3">3 هجمات (سريع)</option>
-                            <option value="5" selected>5 هجمات (متوسط)</option>
-                            <option value="10">10 هجمات (ثقيل)</option>
-                            <option value="15">15 هجوم (شامل)</option>
-                        </select>
-                    </div>
-                    <div class="input-group">
-                        <label>🏷️ اسم الفيديو:</label>
-                        <input type="text" id="fileName" placeholder="اسم الفيديو">
-                    </div>
-                    <button id="extractBtn" onclick="startAttack()">⚔️ بدء الهجوم</button>
-                    <div class="loading" id="loading"><div class="spinner"></div><p>جاري تنفيذ الهجمات...</p></div>
-                    <div class="attack-log" id="attackLog"></div>
-                    <div class="error" id="error"></div>
-                    <div class="success" id="success"></div>
-                    <div class="examples">
-                        <h4>📝 روابط تجريبية:</h4>
-                        <span class="example-link" onclick="setExample('https://www.mediafire.com/file/j0y5aiqzukgp3zw/One+Piece+001+720p.mp4', 'ون بيس')">🎬 ون بيس</span>
-                    </div>
-                </div>
-                <div class="card">
-                    <h2><span>🎬</span> المشغل</h2>
-                    <div class="video-container">
-                        <video id="videoPlayer" controls>
-                            <source id="videoSource" src="" type="video/mp4">
-                            <p id="noVideoMsg" style="text-align:center; padding:50px; color:#999;">⚔️ ابدأ الهجوم لاستخراج الرابط</p>
-                        </video>
-                    </div>
-                    <div class="video-info" id="videoInfo" style="display:none;">
-                        <div class="video-title" id="videoTitle"></div>
-                        <div class="video-controls">
-                            <button class="btn-small" onclick="togglePlay()">⏯️ تشغيل/إيقاف</button>
-                            <button class="btn-small" onclick="fullscreen()">🖥️ ملء الشاشة</button>
-                            <button class="btn-small btn-download" onclick="downloadVideo()">⬇️ تحميل</button>
-                        </div>
-                        <div class="extracted-link" id="extractedLink"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
+        <h1>🎬 MediaFire Video Extractor</h1>
+        <p>كل طلب = هوية جديدة + بصمة مختلفة + تجديد كامل للجلسة</p>
+        
+        <input type="text" id="url" placeholder="رابط MediaFire...">
+        <button onclick="extract()">استخراج وتشغيل</button>
+        
+        <div id="result" class="result" style="display:none;"></div>
+        <video id="player" controls style="display:none;"></video>
+        
         <script>
-            let currentVideoUrl = '';
-            let attackInterval = null;
-            
-            function addLog(message) {
-                const logDiv = document.getElementById('attackLog');
-                logDiv.style.display = 'block';
-                const time = new Date().toLocaleTimeString();
-                logDiv.innerHTML += '<div>[' + time + '] ' + message + '</div>';
-                logDiv.scrollTop = logDiv.scrollHeight;
-            }
-            
-            async function startAttack() {
-                const url = document.getElementById('mediaUrl').value.trim();
-                const attacks = document.getElementById('attackCount').value;
-                let fileName = document.getElementById('fileName').value.trim();
+            async function extract() {
+                const url = document.getElementById('url').value;
+                if(!url) return alert('ادخل رابط');
                 
-                if (!url) { showError('الرجاء إدخال رابط'); return; }
-                if (!url.includes('mediafire.com')) { showError('الرابط يجب أن يكون من MediaFire'); return; }
-                if (!fileName) fileName = 'الفيديو';
+                document.getElementById('result').style.display = 'block';
+                document.getElementById('result').innerHTML = 'جاري الاستخراج...';
                 
-                document.getElementById('error').style.display = 'none';
-                document.getElementById('success').style.display = 'none';
-                document.getElementById('attackLog').innerHTML = '';
-                document.getElementById('attackLog').style.display = 'block';
-                document.getElementById('loading').style.display = 'block';
-                document.getElementById('extractBtn').disabled = true;
+                const res = await fetch('/api/extract', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url})
+                });
+                const data = await res.json();
                 
-                addLog('🎯 بدء سلسلة هجمات على: ' + url);
-                addLog('💪 عدد الهجمات: ' + attacks);
-                
-                try {
-                    const response = await fetch('/api/extract', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ url: url, maxAttempts: parseInt(attacks) })
-                    });
-                    
-                    const data = await response.json();
-                    
-                    if (data.success) {
-                        addLog('✅ نجح الهجوم رقم ' + data.attempt + '!');
-                        addLog('🔗 الرابط المستخرج: ' + data.directLink.substring(0, 80) + '...');
-                        
-                        currentVideoUrl = data.directLink;
-                        const video = document.getElementById('videoPlayer');
-                        const source = document.getElementById('videoSource');
-                        source.src = data.directLink;
-                        video.load();
-                        video.play().catch(e => console.log('auto play:', e));
-                        
-                        document.getElementById('videoInfo').style.display = 'block';
-                        document.getElementById('videoTitle').innerHTML = '🎬 ' + escapeHtml(fileName);
-                        document.getElementById('extractedLink').innerHTML = '<strong>🔗 الرابط:</strong><br>' + escapeHtml(data.directLink);
-                        showSuccess('✅ تم الاستخراج بنجاح بعد ' + data.attempt + ' هجوم!');
-                    } else {
-                        addLog('❌ فشلت جميع الهجمات!');
-                        showError(data.error || 'فشل استخراج الرابط');
-                    }
-                } catch (error) {
-                    addLog('💥 خطأ: ' + error.message);
-                    showError('خطأ: ' + error.message);
-                } finally {
-                    document.getElementById('loading').style.display = 'none';
-                    document.getElementById('extractBtn').disabled = false;
+                if(data.success) {
+                    document.getElementById('result').innerHTML = '✅ الرابط: <br><a href="'+data.directLink+'" target="_blank">'+data.directLink+'</a>';
+                    const video = document.getElementById('player');
+                    video.src = data.directLink;
+                    video.style.display = 'block';
+                    video.play();
+                } else {
+                    document.getElementById('result').innerHTML = '❌ خطأ: '+data.error;
                 }
             }
-            
-            function togglePlay() { const v = document.getElementById('videoPlayer'); v.paused ? v.play() : v.pause(); }
-            function fullscreen() { const v = document.getElementById('videoPlayer'); v.requestFullscreen?.() || v.webkitRequestFullscreen?.(); }
-            function downloadVideo() { if (currentVideoUrl) window.open(currentVideoUrl, '_blank'); }
-            function showError(m) { const e = document.getElementById('error'); e.innerHTML = '❌ ' + m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 5000); }
-            function showSuccess(m) { const s = document.getElementById('success'); s.innerHTML = '✅ ' + m; s.style.display = 'block'; setTimeout(() => s.style.display = 'none', 4000); }
-            function setExample(url, name) { document.getElementById('mediaUrl').value = url; document.getElementById('fileName').value = name; }
-            function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
         </script>
     </body>
-    </html>`;
-    res.send(html);
+    </html>
+    `);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n🚀 السيرفر يعمل على http://localhost:${PORT}`);
-    console.log(`⚔️ وضع الهجوم: مفعل`);
-    console.log(`🎯 كل طلب = سلسلة هجمات متعددة`);
-    console.log(`🔄 يتم تغيير الهوية في كل هجوم`);
+    console.log(`🔐 وضع التمويه: مفعل 100%`);
+    console.log(`🍪 كل طلب = هوية جديدة + كوكيز جديدة + بصمة جديدة`);
 });
