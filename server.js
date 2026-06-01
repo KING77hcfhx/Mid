@@ -67,7 +67,7 @@ function randomDelay(min = 300, max = 1200) {
     return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
 }
 
-// ============= دوال الكشف الجديدة =============
+// ============= دوال الكشف =============
 
 function isCaptchaPage(html) {
     return html.includes('recaptcha') || 
@@ -79,7 +79,6 @@ function isCaptchaPage(html) {
 
 function isVideoLink(link) {
     if (!link) return false;
-    // الروابط الصحيحة للفيديو
     return link.includes('download.mediafire.com') || 
            link.includes('.mp4') ||
            link.includes('.m3u8') ||
@@ -166,7 +165,6 @@ async function extractDirectLink(mediafireUrl) {
                 maxRedirects: 5,
             });
             
-            // 🔥 التحقق من وجود CAPTCHA
             if (isCaptchaPage(html)) {
                 console.log(`   🤖 CAPTCHA detected - IP is blocked`);
                 return { 
@@ -181,7 +179,6 @@ async function extractDirectLink(mediafireUrl) {
                 directLink = extractFromScripts(html);
             }
             
-            // 🔥 التحقق: هل الرابط المستخرج هو فيديو حقيقي؟
             if (directLink && isVideoLink(directLink)) {
                 console.log(`   ✅ رابط فيديو حقيقي: ${directLink}`);
                 return { success: true, directLink: directLink };
@@ -253,7 +250,316 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// ============= صفحة اختبار HTML =============
+
+app.get('/', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MediaFire Extractor - اختبار</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 14px;
+            direction: ltr;
+            transition: border-color 0.3s;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .result {
+            margin-top: 30px;
+            padding: 20px;
+            border-radius: 10px;
+            display: none;
+        }
+        
+        .result.show {
+            display: block;
+        }
+        
+        .result.success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        
+        .result.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        
+        .result.info {
+            background: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+        }
+        
+        .link {
+            word-break: break-all;
+            color: #007bff;
+            text-decoration: none;
+        }
+        
+        .link:hover {
+            text-decoration: underline;
+        }
+        
+        video {
+            width: 100%;
+            margin-top: 20px;
+            border-radius: 10px;
+            display: none;
+        }
+        
+        video.show {
+            display: block;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-left: 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .button-text {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        
+        .footer {
+            background: #f8f9fa;
+            padding: 15px;
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+            border-top: 1px solid #e0e0e0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎬 MediaFire Video Extractor</h1>
+            <p>أدخل رابط MediaFire لاستخراج رابط الفيديو المباشر</p>
+        </div>
+        
+        <div class="content">
+            <div class="input-group">
+                <label>رابط MediaFire:</label>
+                <input type="text" id="urlInput" placeholder="https://www.mediafire.com/file/..." dir="ltr">
+            </div>
+            
+            <button id="extractBtn">
+                <span class="button-text">
+                    <span>🔍 استخراج الرابط</span>
+                </span>
+            </button>
+            
+            <div id="result" class="result"></div>
+            <video id="videoPlayer" controls></video>
+        </div>
+        
+        <div class="footer">
+            <p>⚠️ ملاحظة: إذا ظهرت رسالة CAPTCHA، سيتم فتح الرابط في نافذة جديدة للتحقق</p>
+        </div>
+    </div>
+    
+    <script>
+        const urlInput = document.getElementById('urlInput');
+        const extractBtn = document.getElementById('extractBtn');
+        const resultDiv = document.getElementById('result');
+        const videoPlayer = document.getElementById('videoPlayer');
+        
+        async function extract() {
+            const url = urlInput.value.trim();
+            
+            if (!url) {
+                showResult('الرجاء إدخال رابط MediaFire', 'error');
+                return;
+            }
+            
+            if (!url.includes('mediafire.com')) {
+                showResult('الرابط يجب أن يكون من موقع MediaFire', 'error');
+                return;
+            }
+            
+            // إظهار حالة التحميل
+            extractBtn.disabled = true;
+            extractBtn.querySelector('.button-text').innerHTML = '<div class="loading"></div><span>جاري الاستخراج...</span>';
+            resultDiv.className = 'result';
+            resultDiv.style.display = 'none';
+            videoPlayer.style.display = 'none';
+            
+            try {
+                const response = await fetch('/api/extract', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ url: url })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success && data.directLink) {
+                    // نجح الاستخراج
+                    showResult(\`✅ <strong>تم استخراج الرابط بنجاح!</strong><br><br>
+                    📹 رابط الفيديو:<br>
+                    <a href="\${data.directLink}" target="_blank" class="link">\${data.directLink}</a>\`, 'success');
+                    
+                    // تشغيل الفيديو
+                    videoPlayer.src = data.directLink;
+                    videoPlayer.style.display = 'block';
+                    videoPlayer.play().catch(e => console.log('Auto-play prevented:', e));
+                    
+                } else if (data.error === 'IP_BLOCKED' || data.needsCaptcha) {
+                    // CAPTCHA مطلوب - فتح الرابط تلقائياً
+                    showResult(\`⚠️ <strong>يطلب الموقع تأكيد أنك إنسان (CAPTCHA)</strong><br><br>
+                    🔗 جاري فتح الرابط في نافذة جديدة...<br>
+                    بعد إكمال التحقق، سيتم تشغيل الفيديو.<br><br>
+                    <a href="\${url}" target="_blank" class="link">إذا لم يتم فتح النافذة، اضغط هنا</a>\`, 'info');
+                    
+                    // فتح الرابط تلقائياً في نافذة جديدة
+                    setTimeout(() => {
+                        window.open(url, '_blank');
+                    }, 1000);
+                    
+                } else {
+                    // فشل آخر
+                    showResult(\`❌ <strong>فشل الاستخراج</strong><br><br>\${data.error || 'خطأ غير معروف'}\`, 'error');
+                }
+                
+            } catch (error) {
+                console.error('Error:', error);
+                showResult(\`❌ <strong>خطأ في الاتصال</strong><br><br>\${error.message}\`, 'error');
+            } finally {
+                // إعادة زر الاستخراج
+                extractBtn.disabled = false;
+                extractBtn.querySelector('.button-text').innerHTML = '<span>🔍 استخراج الرابط</span>';
+            }
+        }
+        
+        function showResult(message, type) {
+            resultDiv.innerHTML = message;
+            resultDiv.className = \`result \${type} show\`;
+        }
+        
+        // استخراج عند الضغط على Enter
+        urlInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                extract();
+            }
+        });
+        
+        extractBtn.addEventListener('click', extract);
+    </script>
+</body>
+</html>
+    `);
+});
+
+// ============= تشغيل السيرفر =============
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n🚀 السيرفر يعمل على http://localhost:${PORT}`);
     console.log(`🔐 كشف CAPTCHA: مفعل`);
+    console.log(`📱 صفحة الاختبار: http://localhost:${PORT}`);
 });
