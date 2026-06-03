@@ -4,8 +4,6 @@
   "description": "MediaFire direct link extractor using real browser (Playwright)",
   "main": "server.js",
   "scripts": {
-    "preinstall": "rm -f package-lock.json && npm config set package-lock false",
-    "install": "npm install --no-package-lock --no-audit",
     "postinstall": "npx playwright install chromium",
     "start": "node server.js"
   },
