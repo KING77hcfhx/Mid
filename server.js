@@ -3,27 +3,26 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { chromium } = require('playwright');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.set('trust proxy', 1);
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
+// Rate limiter للـ API
 const limiter = rateLimit({
     windowMs: 60 * 1000,
     max: 30,
     trustProxy: true,
     keyGenerator: (req) => req.ip || req.connection.remoteAddress,
-    standardHeaders: true,
-    legacyHeaders: false,
 });
 app.use('/api/', limiter);
 
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// === كاش النتائج ===
+// ========== الكاش ==========
 const cache = new Map();
 const CACHE_TTL = 30 * 60 * 1000;
 setInterval(() => {
@@ -33,60 +32,76 @@ setInterval(() => {
     }
 }, 5 * 60 * 1000);
 
-// === سجل الأحداث (للواجهة) ===
+// ========== السجل المباشر ==========
 let eventLogs = [];
 const MAX_LOGS = 100;
 function addLog(level, message, meta = {}) {
     const entry = { timestamp: new Date().toISOString(), level, message, ...meta };
     eventLogs.unshift(entry);
     if (eventLogs.length > MAX_LOGS) eventLogs.pop();
-    console.log(`[${level}] ${message}`);
+    console.log(`[${level.toUpperCase()}] ${message}`);
 }
 
-// === مدير المتصفح مع إعادة التشغيل التلقائي ===
-let browserPromise = null;
+// ========== قائمة User-Agents حقيقية ==========
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.2365.66'
+];
 
-async function getBrowser() {
-    if (browserPromise) {
-        try {
-            const b = await browserPromise;
-            if (b && b.isConnected()) return b;
-        } catch (e) {
-            addLog('warn', `بrowser غير صالح: ${e.message}`);
+function randomUserAgent() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function randomViewport() {
+    const widths = [1280, 1366, 1440, 1536, 1600, 1920];
+    const heights = [720, 768, 800, 864, 900, 1080];
+    return {
+        width: widths[Math.floor(Math.random() * widths.length)],
+        height: heights[Math.floor(Math.random() * heights.length)]
+    };
+}
+
+// ========== مدير المتصفح مع تدوير الهوية ==========
+let browserInstance = null;
+let currentProxy = process.env.PROXY_URL || null;
+
+async function getBrowser(forceNew = false) {
+    if (forceNew || !browserInstance || !browserInstance.isConnected()) {
+        if (browserInstance) {
+            await browserInstance.close().catch(() => {});
         }
-    }
-    addLog('info', '🔄 تشغيل Chromium جديد...');
-    browserPromise = chromium.launch({
-        headless: true,
-        args: [
+        const args = [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-gpu',
-            '--disable-accelerated-2d-canvas',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding'
-        ]
-    });
-    const browser = await browserPromise;
-    addLog('info', '✅ Chromium جاهز');
-    return browser;
-}
-
-async function resetBrowser() {
-    addLog('warn', '🔄 إعادة تعيين المتصفح بسبب خطأ');
-    if (browserPromise) {
-        try {
-            const old = await browserPromise;
-            await old.close().catch(() => {});
-        } catch {}
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process'
+        ];
+        if (currentProxy) {
+            args.push(`--proxy-server=${currentProxy}`);
+            addLog('info', `🔒 استخدام بروكسي: ${currentProxy}`);
+        }
+        browserInstance = await chromium.launch({
+            headless: true,
+            args: args
+        });
+        addLog('info', '✅ متصفح جديد تم تشغيله');
     }
-    browserPromise = null;
-    return getBrowser();
+    return browserInstance;
 }
 
-// === استخراج الرابط مع محاولات متعددة وإعادة إنشاء المتصفح ===
+// دالة لتأخير عشوائي (محاكاة التفكير البشري)
+function randomDelay(min = 500, max = 2500) {
+    return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
+}
+
+// استخراج الرابط مع سلوك بشري متقدم
 async function extractDirectLink(url, retry = 0) {
     const start = Date.now();
     addLog('info', `🌐 استخراج: ${url} (محاولة ${retry+1})`);
@@ -94,64 +109,160 @@ async function extractDirectLink(url, retry = 0) {
     let context = null;
     let page = null;
     try {
-        browser = await getBrowser();
+        browser = await getBrowser(retry > 0); // إذا كانت محاولة >0 نستخدم متصفح جديد
+        const userAgent = randomUserAgent();
+        const viewport = randomViewport();
+        
         context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 720 },
-            locale: 'en-US'
+            userAgent: userAgent,
+            viewport: viewport,
+            locale: 'en-US',
+            timezoneId: 'America/New_York',
+            permissions: ['geolocation'],
+            geolocation: { longitude: -74.006, latitude: 40.7128 },
+            extraHTTPHeaders: {
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                'Sec-Ch-Ua-Mobile': '?0',
+                'Sec-Ch-Ua-Platform': '"Windows"',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Upgrade-Insecure-Requests': '1'
+            }
         });
+        
+        // إخفاء علامات الأتمتة
+        await context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+            window.chrome = { runtime: {} };
+            // إضافة canvas fingerprint عشوائي
+            const originalGetContext = HTMLCanvasElement.prototype.getContext;
+            HTMLCanvasElement.prototype.getContext = function(type, ...args) {
+                if (type === '2d') {
+                    const ctx = originalGetContext.call(this, type, ...args);
+                    const originalFillText = ctx.fillText;
+                    ctx.fillText = function(text, x, y, ...rest) {
+                        const randomOffset = Math.random() * 0.01;
+                        return originalFillText.call(this, text, x + randomOffset, y + randomOffset, ...rest);
+                    };
+                    return ctx;
+                }
+                return originalGetContext.call(this, type, ...args);
+            };
+        });
+        
         page = await context.newPage();
         
-        // استخدام domcontentloaded أسرع من networkidle
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        // محاكاة حركة الماوس والتمرير قبل التنقل (سلوك بشري)
+        await page.mouse.move(Math.random() * 500, Math.random() * 400);
+        await randomDelay(300, 800);
         
-        // انتظار عنصر التحميل لمدة قصيرة
-        await page.waitForSelector('a#downloadButton, a.downloadButton, a#download_link', { timeout: 8000 }).catch(() => {});
+        addLog('info', `🚀 جاري تحميل الصفحة باستخدام User-Agent: ${userAgent.substring(0, 50)}...`);
+        await page.goto(url, { waitUntil: 'networkidle', timeout: 35000 });
         
-        let directLink = await page.evaluate(() => {
-            const btn = document.querySelector('a#downloadButton, a.downloadButton, a#download_link');
-            if (btn && btn.href) return btn.href;
-            const scripts = Array.from(document.querySelectorAll('script'));
-            for (let s of scripts) {
-                const match = s.innerHTML.match(/"(https:\/\/download\d+\.mediafire\.com\/[^"]+)"/);
-                if (match) return match[1];
+        // انتظر قليلاً لمحاكاة القراءة
+        await randomDelay(1000, 3000);
+        
+        // التمرير لأسفل ثم لأعلى
+        await page.evaluate(() => window.scrollBy(0, Math.random() * 500 + 200));
+        await randomDelay(500, 1000);
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await randomDelay(300, 600);
+        
+        // البحث عن زر التحميل والنقر عليه (محاكاة تفاعل بشري)
+        const downloadBtn = await page.waitForSelector('a#downloadButton, a.downloadButton, a#download_link, a[aria-label="Download file"]', { timeout: 15000 }).catch(() => null);
+        let directLink = null;
+        
+        if (downloadBtn) {
+            // تحريك الماوس إلى الزر قبل النقر
+            const box = await downloadBtn.boundingBox();
+            if (box) {
+                await page.mouse.move(box.x + box.width/2, box.y + box.height/2);
+                await randomDelay(200, 500);
             }
-            return null;
-        });
+            // محاولة النقر
+            await downloadBtn.click();
+            addLog('info', '🖱️ تم النقر على زر التحميل');
+            await randomDelay(2000, 4000);
+            
+            // بعد النقر، قد يتغير الرابط أو تبدأ عملية التحميل
+            const currentUrl = page.url();
+            if (currentUrl !== url && (currentUrl.includes('download') || currentUrl.includes('mediafire'))) {
+                directLink = currentUrl;
+            } else {
+                // البحث عن الرابط الجديد في الصفحة
+                directLink = await page.evaluate(() => {
+                    const links = Array.from(document.querySelectorAll('a[href*="download"]'));
+                    for (let link of links) {
+                        if (link.href && (link.href.includes('download.mediafire.com') || link.href.includes('mediafire.com/download'))) {
+                            return link.href;
+                        }
+                    }
+                    return null;
+                });
+            }
+        }
         
-        if (!directLink && page.url().includes('download')) directLink = page.url();
+        // إذا لم نجد الرابط بعد النقر، نبحث في الـ HTML
+        if (!directLink) {
+            directLink = await page.evaluate(() => {
+                // البحث في النصوص البرمجية
+                const scripts = Array.from(document.querySelectorAll('script'));
+                for (let script of scripts) {
+                    const content = script.innerHTML;
+                    const match = content.match(/["'](https:\/\/download\d+\.mediafire\.com\/[a-f0-9]+\/[^"']+)["']/);
+                    if (match) return match[1];
+                }
+                // البحث عن أي رابط يحتوي على download.mediafire.com
+                const links = Array.from(document.querySelectorAll('a[href*="download.mediafire.com"]'));
+                if (links.length) return links[0].href;
+                return null;
+            });
+        }
         
-        if (directLink) {
+        if (!directLink && page.url().includes('download')) {
+            directLink = page.url();
+        }
+        
+        await page.close();
+        await context.close();
+        
+        if (directLink && !directLink.includes('verify') && !directLink.includes('human')) {
             addLog('success', `✅ تم الاستخراج (${Date.now()-start}ms): ${directLink.substring(0,80)}...`);
             return { success: true, directLink, timestamp: Date.now() };
         } else {
-            throw new Error('لم يتم العثور على رابط تحميل');
+            // إذا كان الرابط يحتوي على verify أو human، يعني CAPTCHA
+            if (directLink && (directLink.includes('verify') || directLink.includes('human'))) {
+                throw new Error('CAPTCHA detected - MediaFire requires human verification');
+            } else {
+                throw new Error('No valid download link found');
+            }
         }
     } catch (err) {
         const errorMsg = err.message;
         addLog('error', `❌ فشل: ${errorMsg}`);
         
-        // إذا كان الخطأ بسبب إغلاق المتصفح، نعيد تعيينه ونعيد المحاولة
-        if (errorMsg.includes('Target page') || errorMsg.includes('closed') || errorMsg.includes('browser')) {
-            addLog('warn', 'المتصفح مغلق – سيتم إعادة تشغيله');
-            await resetBrowser();
-            if (retry < 3) {
-                await new Promise(r => setTimeout(r, 1500));
+        // إعادة المحاولة إذا كان الخطأ بسبب CAPTCHA أو إغلاق المتصفح
+        if (errorMsg.includes('CAPTCHA') || errorMsg.includes('closed') || errorMsg.includes('Timeout')) {
+            if (retry < 2) {
+                addLog('warn', '🔄 إعادة المحاولة بمتصفح جديد بعد 3 ثوانٍ...');
+                await randomDelay(3000, 5000);
+                // إجبار إنشاء متصفح جديد
+                await getBrowser(true);
                 return extractDirectLink(url, retry + 1);
             }
-        } else if (retry < 2) {
-            await new Promise(r => setTimeout(r, 2000));
+        } else if (retry < 1) {
+            await randomDelay(2000, 4000);
             return extractDirectLink(url, retry + 1);
         }
         return { success: false, error: errorMsg };
-    } finally {
-        if (page) await page.close().catch(() => {});
-        if (context) await context.close().catch(() => {});
-        // نترك المتصفح مفتوحاً للطلبات التالية
     }
 }
 
-// === API endpoints ===
+// ========== API ==========
 app.post('/api/extract', async (req, res) => {
     const { url } = req.body;
     if (!url || !url.includes('mediafire.com')) {
@@ -175,14 +286,14 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'healthy', cacheSize: cache.size, logsCount: eventLogs.length });
 });
 
-// === صفحة HTML (نفس السابقة + محسنة) ===
+// ========== صفحة HTML (نفس السابقة مع تحديث) ==========
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MediaFire Link Extractor</title>
+    <title>MediaFire Link Extractor - Advanced</title>
     <style>
         * { box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e2f; color: #eee; margin: 0; padding: 20px; }
@@ -204,7 +315,6 @@ app.get('/', (req, res) => {
         .log-success { color: #8bc34a; }
         .status { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: #4caf50; margin-right: 8px; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0% { opacity: 0.4; } 100% { opacity: 1; } }
-        hr { border-color: #3a3a4a; }
         a { color: #ff9800; }
     </style>
 </head>
@@ -264,7 +374,7 @@ app.get('/', (req, res) => {
         if (!url) return alert('أدخل رابط MediaFire');
         if (!url.includes('mediafire.com')) return alert('الرابط غير صالح');
         resultArea.style.display = 'block';
-        resultArea.innerHTML = '⏳ جاري الاستخراج... يرجى الانتظار';
+        resultArea.innerHTML = '⏳ جاري الاستخراج... يرجى الانتظار (قد يستغرق 20-30 ثانية)';
         videoPlayer.style.display = 'none';
         videoPlayer.innerHTML = '';
         try {
@@ -284,7 +394,7 @@ app.get('/', (req, res) => {
                     alert('تم نسخ الرابط');
                 });
             } else {
-                resultArea.innerHTML = '<strong>❌ فشل:</strong> ' + (data.error || 'خطأ غير معروف');
+                resultArea.innerHTML = '<strong>❌ فشل:</strong> ' + (data.error || 'خطأ غير معروف') + '<br><br>⚠️ قد يكون MediaFire طلب تحقق بشري. حاول مرة أخرى بعد دقيقة أو استخدم رابط مختلف.';
             }
         } catch (err) {
             resultArea.innerHTML = '<strong>❌ خطأ في الطلب:</strong> ' + err.message;
@@ -300,15 +410,10 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-// تنظيف الخروج
+// ========== إيقاف نظيف ==========
 async function shutdown() {
     addLog('info', 'إيقاف السيرفر...');
-    if (browserPromise) {
-        try {
-            const b = await browserPromise;
-            await b.close();
-        } catch {}
-    }
+    if (browserInstance) await browserInstance.close().catch(() => {});
     process.exit(0);
 }
 process.on('SIGTERM', shutdown);
