@@ -7,10 +7,8 @@ const { chromium } = require('playwright');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// تفعيل trust proxy لأن Railway خلف proxy
 app.set('trust proxy', 1);
 
-// Rate limiter مع دعم proxy
 const limiter = rateLimit({
     windowMs: 60 * 1000,
     max: 30,
@@ -25,11 +23,17 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// الكاش
+// === كاش النتائج ===
 const cache = new Map();
 const CACHE_TTL = 30 * 60 * 1000;
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of cache.entries()) {
+        if (now - v.timestamp > CACHE_TTL) cache.delete(k);
+    }
+}, 5 * 60 * 1000);
 
-// سجل الأحداث (للعرض المباشر في الواجهة)
+// === سجل الأحداث (للواجهة) ===
 let eventLogs = [];
 const MAX_LOGS = 100;
 function addLog(level, message, meta = {}) {
@@ -39,37 +43,56 @@ function addLog(level, message, meta = {}) {
     console.log(`[${level}] ${message}`);
 }
 
-// تنظيف الكاش
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, val] of cache.entries()) {
-        if (now - val.timestamp > CACHE_TTL) cache.delete(key);
-    }
-}, 5 * 60 * 1000);
+// === مدير المتصفح مع إعادة التشغيل التلقائي ===
+let browserPromise = null;
 
-// مدير المتصفح (جلسة واحدة لجميع الطلبات)
-let browserInstance = null;
 async function getBrowser() {
-    if (browserInstance && browserInstance.isConnected()) return browserInstance;
-    addLog('info', '🚀 تشغيل Chromium...');
-    browserInstance = await chromium.launch({
+    if (browserPromise) {
+        try {
+            const b = await browserPromise;
+            if (b && b.isConnected()) return b;
+        } catch (e) {
+            addLog('warn', `بrowser غير صالح: ${e.message}`);
+        }
+    }
+    addLog('info', '🔄 تشغيل Chromium جديد...');
+    browserPromise = chromium.launch({
         headless: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--disable-accelerated-2d-canvas',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding'
         ]
     });
+    const browser = await browserPromise;
     addLog('info', '✅ Chromium جاهز');
-    return browserInstance;
+    return browser;
 }
 
-// استخراج الرابط
+async function resetBrowser() {
+    addLog('warn', '🔄 إعادة تعيين المتصفح بسبب خطأ');
+    if (browserPromise) {
+        try {
+            const old = await browserPromise;
+            await old.close().catch(() => {});
+        } catch {}
+    }
+    browserPromise = null;
+    return getBrowser();
+}
+
+// === استخراج الرابط مع محاولات متعددة وإعادة إنشاء المتصفح ===
 async function extractDirectLink(url, retry = 0) {
     const start = Date.now();
     addLog('info', `🌐 استخراج: ${url} (محاولة ${retry+1})`);
-    let browser, context, page;
+    let browser = null;
+    let context = null;
+    let page = null;
     try {
         browser = await getBrowser();
         context = await browser.newContext({
@@ -79,16 +102,19 @@ async function extractDirectLink(url, retry = 0) {
         });
         page = await context.newPage();
         
-        await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-        await page.waitForSelector('a#downloadButton, a.downloadButton, a#download_link', { timeout: 10000 }).catch(() => {});
+        // استخدام domcontentloaded أسرع من networkidle
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+        
+        // انتظار عنصر التحميل لمدة قصيرة
+        await page.waitForSelector('a#downloadButton, a.downloadButton, a#download_link', { timeout: 8000 }).catch(() => {});
         
         let directLink = await page.evaluate(() => {
             const btn = document.querySelector('a#downloadButton, a.downloadButton, a#download_link');
-            if (btn) return btn.href;
+            if (btn && btn.href) return btn.href;
             const scripts = Array.from(document.querySelectorAll('script'));
             for (let s of scripts) {
-                const match = s.innerHTML.match(/"https:\/\/download\d+\.mediafire\.com\/[^"]+"/);
-                if (match) return match[0].slice(1, -1);
+                const match = s.innerHTML.match(/"(https:\/\/download\d+\.mediafire\.com\/[^"]+)"/);
+                if (match) return match[1];
             }
             return null;
         });
@@ -102,19 +128,30 @@ async function extractDirectLink(url, retry = 0) {
             throw new Error('لم يتم العثور على رابط تحميل');
         }
     } catch (err) {
-        addLog('error', `❌ فشل: ${err.message}`);
-        if (retry < 2) {
-            await new Promise(r => setTimeout(r, 2000 * (retry+1)));
-            return extractDirectLink(url, retry+1);
+        const errorMsg = err.message;
+        addLog('error', `❌ فشل: ${errorMsg}`);
+        
+        // إذا كان الخطأ بسبب إغلاق المتصفح، نعيد تعيينه ونعيد المحاولة
+        if (errorMsg.includes('Target page') || errorMsg.includes('closed') || errorMsg.includes('browser')) {
+            addLog('warn', 'المتصفح مغلق – سيتم إعادة تشغيله');
+            await resetBrowser();
+            if (retry < 3) {
+                await new Promise(r => setTimeout(r, 1500));
+                return extractDirectLink(url, retry + 1);
+            }
+        } else if (retry < 2) {
+            await new Promise(r => setTimeout(r, 2000));
+            return extractDirectLink(url, retry + 1);
         }
-        return { success: false, error: err.message };
+        return { success: false, error: errorMsg };
     } finally {
-        if (page) await page.close().catch(()=>{});
-        if (context) await context.close().catch(()=>{});
+        if (page) await page.close().catch(() => {});
+        if (context) await context.close().catch(() => {});
+        // نترك المتصفح مفتوحاً للطلبات التالية
     }
 }
 
-// -------------------- API --------------------
+// === API endpoints ===
 app.post('/api/extract', async (req, res) => {
     const { url } = req.body;
     if (!url || !url.includes('mediafire.com')) {
@@ -138,10 +175,9 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'healthy', cacheSize: cache.size, logsCount: eventLogs.length });
 });
 
-// -------------------- واجهة HTML متكاملة --------------------
+// === صفحة HTML (نفس السابقة + محسنة) ===
 app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
+    res.send(`<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -188,14 +224,12 @@ app.get('/', (req, res) => {
         <div id="logPanel" class="log-panel"></div>
     </div>
 </div>
-
 <script>
     const extractBtn = document.getElementById('extractBtn');
     const urlInput = document.getElementById('urlInput');
     const resultArea = document.getElementById('resultArea');
     const videoPlayer = document.getElementById('videoPlayer');
     const logPanel = document.getElementById('logPanel');
-
     let lastLogCount = 0;
 
     async function fetchLogs() {
@@ -229,12 +263,10 @@ app.get('/', (req, res) => {
         const url = urlInput.value.trim();
         if (!url) return alert('أدخل رابط MediaFire');
         if (!url.includes('mediafire.com')) return alert('الرابط غير صالح');
-
         resultArea.style.display = 'block';
         resultArea.innerHTML = '⏳ جاري الاستخراج... يرجى الانتظار';
         videoPlayer.style.display = 'none';
         videoPlayer.innerHTML = '';
-
         try {
             const res = await fetch('/api/extract', {
                 method: 'POST',
@@ -261,24 +293,26 @@ app.get('/', (req, res) => {
 
     extractBtn.addEventListener('click', extract);
     urlInput.addEventListener('keypress', (e) => { if(e.key === 'Enter') extract(); });
-
     setInterval(fetchLogs, 800);
     fetchLogs();
 </script>
 </body>
-</html>
-    `);
+</html>`);
 });
 
-// إغلاق نظيف
-process.on('SIGTERM', async () => {
-    if (browserInstance) await browserInstance.close();
+// تنظيف الخروج
+async function shutdown() {
+    addLog('info', 'إيقاف السيرفر...');
+    if (browserPromise) {
+        try {
+            const b = await browserPromise;
+            await b.close();
+        } catch {}
+    }
     process.exit(0);
-});
-process.on('SIGINT', async () => {
-    if (browserInstance) await browserInstance.close();
-    process.exit(0);
-});
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 app.listen(PORT, '0.0.0.0', () => {
     addLog('info', `🚀 السيرفر يعمل على المنفذ ${PORT}`);
