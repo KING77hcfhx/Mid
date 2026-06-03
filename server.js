@@ -1,561 +1,367 @@
+require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
-const cheerio = require('cheerio');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const { chromium } = require('playwright');
+const crypto = require('crypto');
 
+// -------------------------------
+// الإعدادات الأساسية
+// -------------------------------
+const PORT = process.env.PORT || 8080;
+const CACHE_TTL = parseInt(process.env.CACHE_TTL) || 30 * 60 * 1000; // 30 min
+const BROWSER_HEADLESS = process.env.HEADLESS !== 'false';
+const PROXY_URL = process.env.PROXY_URL || null;          // مثال: http://user:pass@ip:port
+const SESSION_TIMEOUT = parseInt(process.env.SESSION_TIMEOUT) || 60 * 60 * 1000; // 1 hour
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES) || 3;
+const CONCURRENT_BROWSERS = parseInt(process.env.CONCURRENT_BROWSERS) || 2;
+
+// -------------------------------
+// ذاكرة تخزين مؤقت (Cache)
+// -------------------------------
+class MemoryCache {
+  constructor(ttl) {
+    this.cache = new Map();
+    this.ttl = ttl;
+    setInterval(() => this.cleanup(), 5 * 60 * 1000);
+  }
+  set(key, value) {
+    this.cache.set(key, { value, timestamp: Date.now() });
+  }
+  get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > this.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+    return entry.value;
+  }
+  delete(key) { this.cache.delete(key); }
+  clear() { this.cache.clear(); }
+  size() { return this.cache.size; }
+  cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now - entry.timestamp > this.ttl) this.cache.delete(key);
+    }
+  }
+}
+const cache = new MemoryCache(CACHE_TTL);
+
+// -------------------------------
+// مدير الجلسات (Session Manager)
+// -------------------------------
+class SessionManager {
+  constructor() {
+    this.sessions = new Map();       // key -> { context, browser, lastUsed }
+    this.browserPool = [];
+    this.poolSize = 0;
+    this.maxPoolSize = CONCURRENT_BROWSERS;
+  }
+
+  async getBrowser() {
+    // إعادة استخدام متصفح موجود
+    if (this.browserPool.length > 0) {
+      return this.browserPool.pop();
+    }
+    if (this.poolSize >= this.maxPoolSize) {
+      // انتظار حتى يتوفر متصفح
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return this.getBrowser();
+    }
+    // إنشاء متصفح جديد
+    this.poolSize++;
+    const browser = await chromium.launch({
+      headless: BROWSER_HEADLESS,
+      proxy: PROXY_URL ? { server: PROXY_URL } : undefined,
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu'
+      ]
+    });
+    return browser;
+  }
+
+  releaseBrowser(browser) {
+    if (this.browserPool.length < this.maxPoolSize) {
+      this.browserPool.push(browser);
+    } else {
+      browser.close().catch(() => {});
+      this.poolSize--;
+    }
+  }
+
+  async getSession(url) {
+    const host = new URL(url).hostname;
+    // نستخدم نطاق الموقع كمفتاح للجلسة (يمكن تعديله ليكون لكل مستخدم نهائي)
+    const sessionKey = host;
+    if (this.sessions.has(sessionKey)) {
+      const session = this.sessions.get(sessionKey);
+      if (Date.now() - session.lastUsed < SESSION_TIMEOUT) {
+        session.lastUsed = Date.now();
+        return session.context;
+      } else {
+        // انتهت صلاحية الجلسة – إغلاقها
+        await session.context.close();
+        await session.browser.close();
+        this.sessions.delete(sessionKey);
+        this.poolSize--;
+      }
+    }
+    // إنشاء سياق جديد (جلسة نظيفة)
+    const browser = await this.getBrowser();
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      permissions: ['geolocation'],
+      geolocation: { longitude: -74.006, latitude: 40.7128 },
+      deviceScaleFactor: 1,
+      hasTouch: false,
+      isMobile: false,
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Upgrade-Insecure-Requests': '1'
+      }
+    });
+    // إخفاء علامات الأتمتة
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+      window.chrome = { runtime: {} };
+    });
+    this.sessions.set(sessionKey, {
+      context,
+      browser,
+      lastUsed: Date.now()
+    });
+    return context;
+  }
+
+  async closeAll() {
+    for (const [key, sess] of this.sessions.entries()) {
+      await sess.context.close();
+      await sess.browser.close();
+      this.sessions.delete(key);
+    }
+    for (const b of this.browserPool) {
+      await b.close();
+    }
+    this.browserPool = [];
+    this.poolSize = 0;
+  }
+}
+const sessionManager = new SessionManager();
+
+// -------------------------------
+// مستخرج الرابط باستخدام Playwright
+// -------------------------------
+async function extractDirectLinkWithBrowser(mediafireUrl, retry = 0) {
+  const startTime = Date.now();
+  console.log(`[${new Date().toISOString()}] 🌐 استخراج: ${mediafireUrl} (محاولة ${retry+1})`);
+  let context = null;
+  try {
+    context = await sessionManager.getSession(mediafireUrl);
+    const page = await context.newPage();
+    
+    // محاكاة سلوك طبيعي: تأخير عشوائي مبدئي
+    await page.waitForTimeout(Math.random() * 500 + 200);
+    
+    // الانتقال إلى الصفحة
+    const response = await page.goto(mediafireUrl, {
+      waitUntil: 'networkidle',
+      timeout: 30000
+    });
+    
+    if (!response || !response.ok()) {
+      throw new Error(`HTTP ${response?.status()}`);
+    }
+    
+    // انتظار وجود عناصر التحميل (قد تظهر بعد تشغيل JS)
+    await page.waitForSelector('a#downloadButton, a.downloadButton, a#download_link, a[aria-label="Download file"]', { timeout: 15000 }).catch(() => {});
+    
+    // محاكاة حركة الماوس والتمرير (سلوك بشري)
+    await page.mouse.move(Math.random() * 800, Math.random() * 600);
+    await page.evaluate(() => window.scrollBy(0, Math.random() * 300 + 100));
+    await page.waitForTimeout(Math.random() * 800 + 300);
+    
+    // البحث عن رابط التحميل المباشر
+    let directLink = null;
+    
+    // الطريقة الأولى: onclick أو href في زر التحميل
+    const downloadBtn = await page.$('a#downloadButton, a.downloadButton, a#download_link, a[aria-label="Download file"]');
+    if (downloadBtn) {
+      const href = await downloadBtn.getAttribute('href');
+      if (href) directLink = href;
+      else {
+        // محاولة النقر إذا كان الزر يشغل JS
+        await downloadBtn.click();
+        await page.waitForTimeout(2000);
+        // بعد النقر قد نحصل على الرابط من الصفحة الجديدة أو من fetch
+        const newUrl = page.url();
+        if (newUrl !== mediafireUrl && newUrl.includes('download')) directLink = newUrl;
+      }
+    }
+    
+    // الطريقة الثانية: استخراج من داخل التطبيقات (JavaScript)
+    if (!directLink) {
+      directLink = await page.evaluate(() => {
+        // البحث في النصوص البرمجية
+        const scripts = Array.from(document.querySelectorAll('script'));
+        for (let script of scripts) {
+          const content = script.innerHTML;
+          const match = content.match(/["'](https:\/\/download\d+\.mediafire\.com\/[a-f0-9]+\/[a-f0-9]+\/[^"']+)["']/);
+          if (match) return match[1];
+        }
+        // البحث عن أي رابط يحتوي على download.mediafire.com
+        const links = Array.from(document.querySelectorAll('a[href*="download.mediafire.com"]'));
+        if (links.length) return links[0].href;
+        return null;
+      });
+    }
+    
+    // الطريقة الثالثة: متابعة redirects
+    if (!directLink && page.url().includes('download')) {
+      directLink = page.url();
+    }
+    
+    await page.close();
+    
+    if (!directLink) {
+      throw new Error('لم يتم العثور على رابط مباشر');
+    }
+    
+    // تنظيف الرابط
+    if (directLink.startsWith('//')) directLink = 'https:' + directLink;
+    if (!directLink.startsWith('http')) directLink = 'https://www.mediafire.com' + directLink;
+    
+    console.log(`[${new Date().toISOString()}] ✅ تم الاستخراج (${Date.now() - startTime}ms): ${directLink}`);
+    return {
+      success: true,
+      directLink,
+      method: 'playwright',
+      timestamp: Date.now()
+    };
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] ❌ فشل: ${error.message}`);
+    if (retry < MAX_RETRIES) {
+      const delay = Math.pow(2, retry) * 1000 + Math.random() * 1000;
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return extractDirectLinkWithBrowser(mediafireUrl, retry + 1);
+    }
+    return {
+      success: false,
+      error: error.message
+    };
+  } finally {
+    // تحرير السياق ليس فورياً لأن SessionManager يديرها؛ لكننا لا نغلق السياق هنا.
+  }
+}
+
+// -------------------------------
+// خادم Express + API
+// -------------------------------
 const app = express();
-const PORT = process.env.PORT || 3800;
-
-// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: { success: false, error: 'Too many requests' }
+}));
 
-// كاش لتخزين النتائج مؤقتًا (لمنع الطلبات المتكررة)
-const cache = new Map();
-const CACHE_DURATION = 30 * 60 * 1000; // 30 دقيقة
-
-/**
- * تنظيف الكاش القديم
- */
-function cleanupCache() {
-    const now = Date.now();
-    for (const [key, value] of cache.entries()) {
-        if (now - value.timestamp > CACHE_DURATION) {
-            cache.delete(key);
-        }
-    }
-}
-
-// تنظيف الكاش كل 5 دقائق
-setInterval(cleanupCache, 5 * 60 * 1000);
-
-/**
- * استخراج الرابط المباشر من MediaFire
- */
-async function extractDirectLink(mediafireUrl) {
-    try {
-        console.log(`🔍 جاري تحليل الرابط: ${mediafireUrl}`);
-        
-        const { data: html } = await axios.get(mediafireUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            },
-            timeout: 10000
-        });
-        
-        const $ = cheerio.load(html);
-        
-        // الطريقة 1: البحث في زر التحميل الرئيسي
-        let directLink = $('#downloadButton').attr('href');
-        
-        // الطريقة 2: البحث في عناصر التحميل الأخرى
-        if (!directLink) {
-            directLink = $('a.downloadButton').attr('href') ||
-                        $('a#download_link').attr('href') ||
-                        $('a[aria-label="Download file"]').attr('href');
-        }
-        
-        // الطريقة 3: البحث في البيانات البرمجية
-        if (!directLink) {
-            // البحث في النصوص البرمجية للرابط المباشر
-            const scriptPatterns = [
-                /"download_link"\s*:\s*"([^"]+)"/i,
-                /downloadUrl\s*:\s*['"]([^'"]+)['"]/i,
-                /"href"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"Download Now"/i,
-                /https:\/\/download\d+\.mediafire\.com\/[a-z0-9]+\/[a-z0-9]+\/[^'"]+/i
-            ];
-            
-            $('script').each((index, script) => {
-                const scriptContent = $(script).html();
-                if (scriptContent) {
-                    for (const pattern of scriptPatterns) {
-                        const match = scriptContent.match(pattern);
-                        if (match && match[1]) {
-                            directLink = match[1];
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-        
-        // الطريقة 4: البحث في جميع الروابط التي تحتوي على download
-        if (!directLink) {
-            $('a[href*="download"]').each((index, element) => {
-                const href = $(element).attr('href');
-                if (href && href.includes('mediafire.com')) {
-                    directLink = href;
-                    return false;
-                }
-            });
-        }
-        
-        // معالجة الرابط
-        if (directLink) {
-            // إصلاح الروابط النسبية
-            if (directLink.startsWith('//')) {
-                directLink = 'https:' + directLink;
-            } else if (directLink.startsWith('/')) {
-                directLink = 'https://www.mediafire.com' + directLink;
-            }
-            
-            // التأكد من أن الرابط هو رابط تنزيل مباشر
-            if (!directLink.includes('download') && directLink.includes('mediafire.com/file/')) {
-                // تحويل رابط الملف إلى رابط تنزيل
-                const fileIdMatch = directLink.match(/mediafire\.com\/file\/([a-z0-9]+)/i);
-                if (fileIdMatch) {
-                    directLink = `https://download${Math.floor(Math.random() * 3) + 1}.mediafire.com/${fileIdMatch[1]}`;
-                }
-            }
-            
-            console.log(`✅ تم استخراج الرابط المباشر: ${directLink}`);
-            
-            // التحقق من أن الرابط يعمل
-            try {
-                const response = await axios.head(directLink, {
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    },
-                    timeout: 5000
-                });
-                
-                if (response.status === 200 || response.status === 302) {
-                    return {
-                        success: true,
-                        directLink: directLink,
-                        contentType: response.headers['content-type'] || 'application/octet-stream',
-                        contentLength: response.headers['content-length'],
-                        timestamp: Date.now()
-                    };
-                }
-            } catch (headError) {
-                console.log('⚠️ تحذير: لا يمكن التحقق من الرابط، ولكن سيتم استخدامه:', headError.message);
-            }
-            
-            return {
-                success: true,
-                directLink: directLink,
-                timestamp: Date.now()
-            };
-        } else {
-            console.log('❌ لم يتم العثور على رابط مباشر');
-            return {
-                success: false,
-                error: 'لم يتم العثور على رابط مباشر في الصفحة'
-            };
-        }
-        
-    } catch (error) {
-        console.error(`❌ خطأ في استخراج الرابط: ${error.message}`);
-        return {
-            success: false,
-            error: `خطأ في استخراج الرابط: ${error.message}`
-        };
-    }
-}
-
-/**
- * نقطة النهاية لاستخراج الروابط
- */
-app.post('/api/extract', async (req, res) => {
-    try {
-        const { url, cacheKey } = req.body;
-        
-        if (!url) {
-            return res.status(400).json({
-                success: false,
-                error: 'يرجى إرسال رابط MediaFire'
-            });
-        }
-        
-        if (!url.includes('mediafire.com')) {
-            return res.status(400).json({
-                success: false,
-                error: 'الرابط يجب أن يكون من موقع MediaFire'
-            });
-        }
-        
-        // التحقق من الكاش أولاً
-        const cacheKeyToUse = cacheKey || url;
-        const cachedResult = cache.get(cacheKeyToUse);
-        
-        if (cachedResult && (Date.now() - cachedResult.timestamp < CACHE_DURATION)) {
-            console.log('📦 استرجاع من الكاش:', cacheKeyToUse);
-            return res.json({
-                ...cachedResult,
-                cached: true
-            });
-        }
-        
-        // استخراج الرابط
-        const result = await extractDirectLink(url);
-        
-        // تخزين في الكاش
-        if (result.success) {
-            cache.set(cacheKeyToUse, result);
-        }
-        
-        res.json(result);
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-/**
- * نقطة النهاية GET
- */
-app.get('/api/extract', async (req, res) => {
-    try {
-        const { url, cacheKey } = req.query;
-        
-        if (!url) {
-            return res.status(400).json({
-                success: false,
-                error: 'يرجى إضافة رابط MediaFire كمعامل url'
-            });
-        }
-        
-        if (!url.includes('mediafire.com')) {
-            return res.status(400).json({
-                success: false,
-                error: 'الرابط يجب أن يكون من موقع MediaFire'
-            });
-        }
-        
-        // التحقق من الكاش أولاً
-        const cacheKeyToUse = cacheKey || url;
-        const cachedResult = cache.get(cacheKeyToUse);
-        
-        if (cachedResult && (Date.now() - cachedResult.timestamp < CACHE_DURATION)) {
-            console.log('📦 استرجاع من الكاش:', cacheKeyToUse);
-            return res.json({
-                ...cachedResult,
-                cached: true
-            });
-        }
-        
-        // استخراج الرابط
-        const result = await extractDirectLink(url);
-        
-        // تخزين في الكاش
-        if (result.success) {
-            cache.set(cacheKeyToUse, result);
-        }
-        
-        res.json(result);
-        
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-/**
- * نقطة نهاية للتحقق من حالة السيرفر
- */
 app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        cacheSize: cache.size
-    });
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    cacheSize: cache.size(),
+    activeSessions: sessionManager.sessions.size,
+    browserPool: sessionManager.browserPool.length
+  });
 });
 
-/**
- * نقطة نهاية لمسح الكاش
- */
-app.delete('/api/cache', (req, res) => {
-    const { key } = req.query;
-    
-    if (key) {
-        cache.delete(key);
-        res.json({
-            success: true,
-            message: `تم حذف المفتاح ${key} من الكاش`
-        });
-    } else {
-        cache.clear();
-        res.json({
-            success: true,
-            message: 'تم مسح الكاش بالكامل'
-        });
+app.post('/api/extract', async (req, res) => {
+  const { url, bypassCache = false } = req.body;
+  if (!url || !url.includes('mediafire.com')) {
+    return res.status(400).json({ success: false, error: 'Invalid MediaFire URL' });
+  }
+  
+  const cacheKey = crypto.createHash('md5').update(url).digest('hex');
+  if (!bypassCache) {
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      console.log(`[${new Date().toISOString()}] 📦 Cache hit for ${url}`);
+      return res.json({ ...cached, cached: true });
     }
+  }
+  
+  const result = await extractDirectLinkWithBrowser(url);
+  if (result.success) {
+    cache.set(cacheKey, result);
+  }
+  res.json(result);
 });
 
-/**
- * صفحة HTML للاختبار
- */
+app.get('/api/extract', async (req, res) => {
+  const { url, bypassCache } = req.query;
+  if (!url) return res.status(400).json({ success: false, error: 'Missing url parameter' });
+  return app.handle({ method: 'POST', body: { url, bypassCache: bypassCache === 'true' }, headers: req.headers }, res);
+});
+
+app.delete('/api/cache', (req, res) => {
+  const { key } = req.query;
+  if (key) cache.delete(key);
+  else cache.clear();
+  res.json({ success: true });
+});
+
+// صفحة اختبار بسيطة
 app.get('/', (req, res) => {
-    const html = `
+  res.send(`
     <!DOCTYPE html>
     <html>
-    <head>
-        <title>MediaFire Direct Link Extractor API</title>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                line-height: 1.6;
-                color: #333;
-                max-width: 800px;
-                margin: 0 auto;
-                padding: 20px;
-                background-color: #f5f5f5;
-            }
-            .container {
-                background: white;
-                border-radius: 10px;
-                padding: 30px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            }
-            h1 {
-                color: #2c3e50;
-                border-bottom: 2px solid #3498db;
-                padding-bottom: 10px;
-            }
-            .endpoint {
-                background: #f8f9fa;
-                border-left: 4px solid #3498db;
-                padding: 15px;
-                margin: 20px 0;
-                border-radius: 4px;
-            }
-            code {
-                background: #2c3e50;
-                color: #ecf0f1;
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-family: 'Courier New', monospace;
-            }
-            .test-form {
-                margin-top: 30px;
-                padding: 20px;
-                background: #f8f9fa;
-                border-radius: 8px;
-            }
-            input[type="text"] {
-                width: 100%;
-                padding: 12px;
-                margin: 10px 0;
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                box-sizing: border-box;
-                font-size: 16px;
-            }
-            button {
-                background: #3498db;
-                color: white;
-                border: none;
-                padding: 12px 24px;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 16px;
-                transition: background 0.3s;
-            }
-            button:hover {
-                background: #2980b9;
-            }
-            .result {
-                margin-top: 20px;
-                padding: 15px;
-                border-radius: 4px;
-                display: none;
-            }
-            .success {
-                background: #d4edda;
-                border: 1px solid #c3e6cb;
-                color: #155724;
-            }
-            .error {
-                background: #f8d7da;
-                border: 1px solid #f5c6cb;
-                color: #721c24;
-            }
-            .loading {
-                background: #d1ecf1;
-                border: 1px solid #bee5eb;
-                color: #0c5460;
-            }
-            .api-info {
-                background: #e8f4f8;
-                padding: 15px;
-                border-radius: 8px;
-                margin: 20px 0;
-            }
-        </style>
-    </head>
+    <head><title>MediaFire Real Browser Resolver</title></head>
     <body>
-        <div class="container">
-            <h1>🌐 MediaFire Direct Link Extractor API</h1>
-            
-            <div class="api-info">
-                <p><strong>📊 حالة السيرفر:</strong> <span id="status">جاري التحقق...</span></p>
-                <p><strong>📦 حجم الكاش:</strong> <span id="cacheSize">--</span> عنصر</p>
-            </div>
-            
-            <h2>🎯 نقاط النهاية المتاحة:</h2>
-            
-            <div class="endpoint">
-                <h3>POST /api/extract</h3>
-                <p>استخراج رابط مباشر من MediaFire</p>
-                <code>{
-    "url": "https://www.mediafire.com/file/..."
-}</code>
-            </div>
-            
-            <div class="endpoint">
-                <h3>GET /api/extract?url=...</h3>
-                <p>استخراج رابط مباشر عبر GET</p>
-            </div>
-            
-            <div class="endpoint">
-                <h3>GET /api/health</h3>
-                <p>فحص حالة السيرفر</p>
-            </div>
-            
-            <div class="test-form">
-                <h2>🧪 اختبار API</h2>
-                <input type="text" id="testUrl" placeholder="أدخل رابط MediaFire هنا..." value="https://www.mediafire.com/file/j0y5aiqzukgp3zw/One+Piece+001+720p.mp4">
-                <button onclick="testExtract()">اختبار الاستخراج</button>
-                
-                <div id="testResult" class="result"></div>
-            </div>
-            
-            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
-                <p><strong>📝 ملاحظات:</strong></p>
-                <ul>
-                    <li>السيرفر يستخدم كاش لتخزين النتائج لمدة 30 دقيقة</li>
-                    <li>يدعم الطلبات عبر CORS</li>
-                    <li>يعمل مع معظم روابط MediaFire</li>
-                </ul>
-            </div>
-        </div>
-        
-        <script>
-            // التحقق من حالة السيرفر
-            async function checkStatus() {
-                try {
-                    const response = await fetch('/api/health');
-                    const data = await response.json();
-                    document.getElementById('status').textContent = 'يعمل ✅';
-                    document.getElementById('cacheSize').textContent = data.cacheSize;
-                } catch (error) {
-                    document.getElementById('status').textContent = 'غير متصل ❌';
-                }
-            }
-            
-            // اختبار الاستخراج
-            async function testExtract() {
-                const url = document.getElementById('testUrl').value.trim();
-                const resultDiv = document.getElementById('testResult');
-                
-                if (!url) {
-                    showResult('يرجى إدخال رابط', 'error');
-                    return;
-                }
-                
-                if (!url.includes('mediafire.com')) {
-                    showResult('الرابط يجب أن يكون من موقع MediaFire', 'error');
-                    return;
-                }
-                
-                showResult('جاري استخراج الرابط المباشر...', 'loading');
-                
-                try {
-                    const response = await fetch('/api/extract', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({ url: url })
-                    });
-                    
-                    const data = await response.json();
-                    
-                    if (data.success) {
-                        const html = '<h3 style="color: #27ae60;">✅ تم الاستخراج بنجاح</h3>' +
-                                   '<p><strong>الرابط المباشر:</strong></p>' +
-                                   '<div style="background: white; padding: 10px; border-radius: 4px; margin: 10px 0; word-break: break-all;">' + 
-                                   escapeHtml(data.directLink) + 
-                                   '</div>' +
-                                   (data.cached ? '<p><em>📦 تم استرجاعه من الكاش</em></p>' : '') +
-                                   '<div style="margin-top: 10px;">' +
-                                   '<button onclick="copyToClipboard(\\'' + escapeSingleQuotes(data.directLink) + '\\')" style="margin-right: 10px;">نسخ الرابط</button>' +
-                                   '<button onclick="window.open(\\'' + escapeSingleQuotes(data.directLink) + '\\', \\'_blank\\')">فتح الرابط</button>' +
-                                   '</div>';
-                        showResult(html, 'success');
-                    } else {
-                        showResult('<h3 style="color: #e74c3c;">❌ خطأ</h3><p>' + escapeHtml(data.error) + '</p>', 'error');
-                    }
-                } catch (error) {
-                    showResult('<h3 style="color: #e74c3c;">❌ خطأ في الاتصال</h3><p>' + escapeHtml(error.message) + '</p>', 'error');
-                }
-            }
-            
-            function showResult(content, type) {
-                const resultDiv = document.getElementById('testResult');
-                resultDiv.innerHTML = content;
-                resultDiv.className = 'result ' + type;
-                resultDiv.style.display = 'block';
-            }
-            
-            function copyToClipboard(text) {
-                navigator.clipboard.writeText(text).then(() => {
-                    alert('✅ تم نسخ الرابط إلى الحافظة');
-                }).catch(err => {
-                    alert('❌ فشل نسخ الرابط: ' + err);
-                });
-            }
-            
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-            
-            function escapeSingleQuotes(text) {
-                return text.replace(/'/g, "\\'");
-            }
-            
-            // التحقق من الحالة عند التحميل
-            checkStatus();
-            // تحديث حالة الكاش كل 30 ثانية
-            setInterval(checkStatus, 30000);
-        </script>
+      <h2>MediaFire Direct Link Extractor (Playwright)</h2>
+      <input type="text" id="url" placeholder="MediaFire URL" style="width:400px"/>
+      <button onclick="extract()">Extract</button>
+      <pre id="result"></pre>
+      <script>
+        async function extract() {
+          const url = document.getElementById('url').value;
+          const res = await fetch('/api/extract', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url}) });
+          const data = await res.json();
+          document.getElementById('result').innerText = JSON.stringify(data, null, 2);
+        }
+      </script>
     </body>
     </html>
-    `;
-    
-    res.send(html);
+  `);
 });
 
-// معالجة الأخطاء
-app.use((err, req, res, next) => {
-    console.error('❌ خطأ في السيرفر:', err.stack);
-    res.status(500).json({
-        success: false,
-        error: 'خطأ داخلي في السيرفر'
-    });
+// إيقاف نظيف عند الخروج
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+  await sessionManager.closeAll();
+  process.exit(0);
 });
 
-// تشغيل السيرفر
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 السيرفر يعمل على http://localhost:${PORT}`);
-    console.log(`📌 نقطة النهاية: POST /api/extract`);
-    console.log(`📌 نقطة النهاية: GET /api/extract?url=رابط_الملف`);
-    console.log(`📌 صفحة الاختبار: http://localhost:${PORT}/`);
-
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`   Headless mode: ${BROWSER_HEADLESS}`);
+  console.log(`   Proxy: ${PROXY_URL || 'none'}`);
 });
